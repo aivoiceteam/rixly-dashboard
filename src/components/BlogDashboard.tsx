@@ -124,6 +124,19 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
     return null;
   };
 
+  const extractRetryDelayMs = (message: string): number | null => {
+    if (!message) return null;
+    const retryInfoMatch = message.match(/"retryDelay"\s*:\s*"(\d+)s"/i);
+    if (retryInfoMatch?.[1]) {
+      return Number(retryInfoMatch[1]) * 1000;
+    }
+    const plainSecondsMatch = message.match(/retry in\s+([0-9]+(?:\.[0-9]+)?)s?/i);
+    if (plainSecondsMatch?.[1]) {
+      return Math.ceil(Number(plainSecondsMatch[1]) * 1000);
+    }
+    return null;
+  };
+
   const compressImage = (base64Str: string): Promise<string> => {
     return new Promise((resolve, reject) => {
       const img = new Image();
@@ -259,6 +272,8 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
             }
           });
 
+          await setDoc(doc(db, "settings", settingsDocId), { lastGeneratedAt: serverTimestamp() }, { merge: true });
+
           addLog(`Successfully generated: ${item.topic}`, "success");
 
           // Bypass scheduler when user manually clicks pre-generate: publish immediately.
@@ -277,6 +292,19 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
           }
         } catch (itemError: any) {
           addLog(`Failed to generate "${item.topic}": ${itemError.message}`, "error");
+
+          try {
+            const retryDelayMs = extractRetryDelayMs(itemError?.message || "") || 60000;
+            const safeRetryDelayMs = Math.max(10000, Math.min(retryDelayMs + 2000, 5 * 60 * 1000));
+            await updateDoc(doc(db, queueCollectionName, item.id), {
+              scheduledAt: new Date(Date.now() + safeRetryDelayMs),
+              lastError: itemError?.message || "Generation failed",
+            });
+            addLog(`Rescheduled ${item.topic} after failure in ${Math.ceil(safeRetryDelayMs / 1000)}s.`, "info");
+          } catch (rescheduleError: any) {
+            console.error("Failed to reschedule item after error:", rescheduleError);
+          }
+
           throw itemError;
         }
       }
@@ -293,15 +321,15 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
   React.useEffect(() => {
     const interval = setInterval(() => {
       const pendingItems = queue.filter(t => t.status === 'pending');
-      const generatedCount = queue.filter(t => t.status === 'generated').length;
 
-      if (pendingItems.length === 0 || generatedCount > 0 || isGenerating) {
+      if (pendingItems.length === 0 || isGenerating) {
         setIsTimerActive(false);
         setCountdown(timerDuration);
         return;
       }
 
       const nowMs = Date.now();
+      const lastGeneratedMs = toMillisSafe(settings?.lastGeneratedAt);
       const nextDueMs = pendingItems
         .map((item) => {
           const scheduledMs = toMillisSafe(item.scheduledAt);
@@ -320,12 +348,17 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
         return;
       }
 
+      const minCadenceDueMs = lastGeneratedMs !== null
+        ? lastGeneratedMs + Math.max(0, timerDuration) * 1000
+        : nextDueMs;
+      const effectiveDueMs = Math.max(nextDueMs, minCadenceDueMs);
+
       setIsTimerActive(true);
-      setCountdown(Math.max(0, Math.ceil((nextDueMs - nowMs) / 1000)));
+      setCountdown(Math.max(0, Math.ceil((effectiveDueMs - nowMs) / 1000)));
     }, 1000);
 
     return () => clearInterval(interval);
-  }, [queue, isGenerating, timerDuration]);
+  }, [queue, isGenerating, timerDuration, settings?.lastGeneratedAt]);
 
   React.useEffect(() => {
     if (isTimerActive && countdown === 0 && !isGenerating) {
@@ -355,8 +388,24 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
 
     try {
       toast.info(`Adding ${topicList.length} topics to queue...`);
-      for (const item of topicList) {
-        const scheduledAt = new Date(Date.now() + Math.max(0, timerDuration) * 1000);
+      const pendingItems = queue.filter(t => t.status === 'pending');
+      const latestPendingDueMs = pendingItems
+        .map((item) => {
+          const scheduledMs = toMillisSafe(item.scheduledAt);
+          if (scheduledMs !== null) return scheduledMs;
+          const createdMs = toMillisSafe(item.createdAt);
+          const itemDelaySeconds = typeof item.delaySeconds === "number" ? Math.max(0, item.delaySeconds) : Math.max(0, timerDuration);
+          return createdMs !== null ? createdMs + itemDelaySeconds * 1000 : null;
+        })
+        .filter((value): value is number => value !== null)
+        .sort((a, b) => b - a)[0];
+
+      const baseScheduleMs = Math.max(Date.now(), latestPendingDueMs ?? Date.now());
+      const delayMs = Math.max(0, timerDuration) * 1000;
+
+      for (let index = 0; index < topicList.length; index++) {
+        const item = topicList[index];
+        const scheduledAt = new Date(baseScheduleMs + delayMs * (index + 1));
         await addDoc(collection(db, queueCollectionName), {
           topic: item.topic,
           customInstructions: item.instructions,

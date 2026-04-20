@@ -46,6 +46,54 @@ async function callWithRetry<T>(
   }
 
   let keysAttempted = 0;
+  let sawOnlyTransientFailures = false;
+
+  const sleep = (ms: number) => new Promise((resolve) => setTimeout(resolve, ms));
+
+  const classifyError = (error: any) => {
+    const errorStr = JSON.stringify(error || {});
+    const errorMsg = (error?.message || "").toLowerCase();
+
+    const isQuotaError =
+      errorStr.includes("429") ||
+      errorStr.includes("RESOURCE_EXHAUSTED") ||
+      errorMsg.includes("quota") ||
+      errorMsg.includes("limit") ||
+      errorMsg.includes("429");
+
+    const isServerError =
+      errorStr.includes("503") ||
+      errorStr.includes("UNAVAILABLE") ||
+      errorMsg.includes("service unavailable") ||
+      errorMsg.includes("server is busy") ||
+      errorMsg.includes("currently experiencing high demand") ||
+      errorMsg.includes("unavailable") ||
+      errorMsg.includes("empty response");
+
+    const isPermissionError =
+      errorStr.includes("403") ||
+      errorMsg.includes("permission_denied") ||
+      errorMsg.includes("not have permission");
+
+    const isRecitationError =
+      errorStr.includes("RECITATION") ||
+      errorMsg.includes("recitation");
+
+    const isNotFoundError =
+      errorStr.includes("404") ||
+      errorMsg.includes("not found") ||
+      errorMsg.includes("entity was not found");
+
+    return {
+      errorStr,
+      errorMsg,
+      isQuotaError,
+      isServerError,
+      isPermissionError,
+      isRecitationError,
+      isNotFoundError,
+    };
+  };
 
   const getRetryDelayMs = (errorText: string): number => {
     const retryInfoMatch = errorText.match(/"retryDelay"\s*:\s*"(\d+)s"/i);
@@ -61,79 +109,95 @@ async function callWithRetry<T>(
     return 0;
   };
 
-  for (const key of uniqueKeys) {
-    keysAttempted++;
-    const ai = new GoogleGenAI({ apiKey: key });
+  const maxRounds = 3;
+  for (let round = 1; round <= maxRounds; round++) {
+    let roundHadOnlyTransientFailures = true;
 
-    for (let attempt = 1; attempt <= 2; attempt++) {
-      try {
-        const result = await operation(ai);
-        // If the operation returned something that looks like an empty response, treat it as an error to trigger retry
-        if (result && (result as any).text === "") {
-          throw new Error("Empty response from Gemini");
-        }
-        return result;
-      } catch (error: any) {
-        lastError = error;
+    for (const key of uniqueKeys) {
+      keysAttempted++;
+      const ai = new GoogleGenAI({ apiKey: key });
 
-        // Extract full error context for better detection
-        const errorStr = JSON.stringify(error);
-        const errorMsg = (error.message || "").toLowerCase();
+      for (let attempt = 1; attempt <= 2; attempt++) {
+        try {
+          const result = await operation(ai);
+          // If the operation returned something that looks like an empty response, treat it as an error to trigger retry
+          if (result && (result as any).text === "") {
+            throw new Error("Empty response from Gemini");
+          }
+          return result;
+        } catch (error: any) {
+          lastError = error;
+          const {
+            errorStr,
+            errorMsg,
+            isQuotaError,
+            isServerError,
+            isPermissionError,
+            isRecitationError,
+            isNotFoundError,
+          } = classifyError(error);
 
-        const isQuotaError =
-          errorStr.includes("429") ||
-          errorStr.includes("RESOURCE_EXHAUSTED") ||
-          errorMsg.includes("quota") ||
-          errorMsg.includes("limit") ||
-          errorMsg.includes("429");
+          // For quota errors with explicit retry info, retry same key once after waiting.
+          if (isQuotaError && attempt === 1) {
+            const retryDelayMs = getRetryDelayMs(errorStr || error?.message || "");
+            if (retryDelayMs > 0 && retryDelayMs <= 120000) {
+              const waitMs = retryDelayMs + 1000;
+              console.warn(`API Key #${keysAttempted} hit quota. Waiting ${Math.ceil(waitMs / 1000)}s before retrying same key...`);
+              await sleep(waitMs);
+              continue;
+            }
+          }
 
-        const isServerError =
-          errorStr.includes("503") ||
-          errorMsg.includes("service unavailable") ||
-          errorMsg.includes("server is busy") ||
-          errorMsg.includes("empty response");
-
-        const isPermissionError =
-          errorStr.includes("403") ||
-          errorMsg.includes("permission_denied") ||
-          errorMsg.includes("not have permission");
-
-        const isRecitationError =
-          errorStr.includes("RECITATION") ||
-          errorMsg.includes("recitation");
-
-        const isNotFoundError =
-          errorStr.includes("404") ||
-          errorMsg.includes("not found") ||
-          errorMsg.includes("entity was not found");
-
-        // For quota errors with explicit retry info, retry same key once after waiting.
-        if (isQuotaError && attempt === 1) {
-          const retryDelayMs = getRetryDelayMs(errorStr || error.message || "");
-          if (retryDelayMs > 0 && retryDelayMs <= 120000) {
-            const waitMs = retryDelayMs + 1000;
-            console.warn(`API Key #${keysAttempted} hit quota. Waiting ${Math.ceil(waitMs / 1000)}s before retrying same key...`);
-            await new Promise((resolve) => setTimeout(resolve, waitMs));
+          // For transient 503/unavailable errors, retry same key quickly once before rotating.
+          if (isServerError && attempt === 1) {
+            const quickBackoffMs = 3000 + Math.floor(Math.random() * 1500);
+            console.warn(`API Key #${keysAttempted} temporary server issue (${errorMsg || 'unavailable'}). Retrying same key in ${Math.ceil(quickBackoffMs / 1000)}s...`);
+            await sleep(quickBackoffMs);
             continue;
           }
-        }
 
-        if (isQuotaError || isServerError || isPermissionError || isNotFoundError || isRecitationError) {
-          console.warn(`API Key #${keysAttempted} issue detected (${errorMsg || 'Quota/Server/Permission/NotFound/Recitation Error'}), trying next key...`);
-          // Small delay before trying next key to avoid rapid-fire failures
-          await new Promise(resolve => setTimeout(resolve, 1000));
+          if (isPermissionError || isNotFoundError || isRecitationError) {
+            roundHadOnlyTransientFailures = false;
+          }
+
+          if (isQuotaError || isServerError || isPermissionError || isNotFoundError || isRecitationError) {
+            console.warn(`API Key #${keysAttempted} issue detected (${errorMsg || 'Quota/Server/Permission/NotFound/Recitation Error'}), trying next key...`);
+            await sleep(1000);
+            break;
+          }
+
+          roundHadOnlyTransientFailures = false;
+          console.warn(`Operation failed with key #${keysAttempted}, trying next... Error: ${errorMsg}`);
           break;
         }
-
-        console.warn(`Operation failed with key #${keysAttempted}, trying next... Error: ${errorMsg}`);
-        break;
       }
     }
+
+    if (roundHadOnlyTransientFailures && round < maxRounds) {
+      sawOnlyTransientFailures = true;
+      const roundBackoffMs = round * 6000;
+      console.warn(`All keys failed due to transient demand/server errors in round ${round}. Retrying full key set in ${Math.ceil(roundBackoffMs / 1000)}s...`);
+      await sleep(roundBackoffMs);
+      continue;
+    }
+
+    break;
   }
   
   // If we're here, all keys failed. Provide a clear message.
   const finalError = lastError?.message || JSON.stringify(lastError) || "Unknown error";
   const finalErrorLower = finalError.toLowerCase();
+
+  if (
+    sawOnlyTransientFailures ||
+    finalError.includes("503") ||
+    finalErrorLower.includes("unavailable") ||
+    finalErrorLower.includes("high demand")
+  ) {
+    throw new Error(
+      `Gemini is temporarily overloaded (503/UNAVAILABLE). I retried automatically multiple times but it is still busy. Please keep the queue item pending and retry shortly. Details: ${finalError}`
+    );
+  }
 
   if (
     finalErrorLower.includes("api key not valid") ||
