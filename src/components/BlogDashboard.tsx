@@ -116,6 +116,14 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
     setLogs(prev => [...prev, { message, timestamp: new Date().toLocaleTimeString(), type }]);
   };
 
+  const toMillisSafe = (value: any): number | null => {
+    if (!value) return null;
+    if (typeof value?.toMillis === "function") return value.toMillis();
+    if (value instanceof Date) return value.getTime();
+    if (typeof value === "number" && Number.isFinite(value)) return value;
+    return null;
+  };
+
   const compressImage = (base64Str: string): Promise<string> => {
     return new Promise((resolve, reject) => {
       const img = new Image();
@@ -194,9 +202,17 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
   };
 
   const preGenerate = async () => {
-    const pendingItems = queue.filter(t => t.status === 'pending').sort((a, b) => {
-      const timeA = a.createdAt?.toMillis() || 0;
-      const timeB = b.createdAt?.toMillis() || 0;
+    const nowMs = Date.now();
+    const pendingItems = queue.filter(t => {
+      if (t.status !== 'pending') return false;
+      const scheduledMs = toMillisSafe(t.scheduledAt);
+      if (scheduledMs !== null) return scheduledMs <= nowMs;
+      const createdMs = toMillisSafe(t.createdAt);
+      const itemDelaySeconds = typeof t.delaySeconds === "number" ? Math.max(0, t.delaySeconds) : Math.max(0, timerDuration);
+      return createdMs !== null ? createdMs + (itemDelaySeconds * 1000) <= nowMs : false;
+    }).sort((a, b) => {
+      const timeA = toMillisSafe(a.scheduledAt) ?? toMillisSafe(a.createdAt) ?? 0;
+      const timeB = toMillisSafe(b.scheduledAt) ?? toMillisSafe(b.createdAt) ?? 0;
       return timeA - timeB;
     }).slice(0, 1);
     
@@ -274,33 +290,51 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
     }
   };
 
-  // Auto-generation logic: If there are pending topics and no generated ones, start generating
   React.useEffect(() => {
-    const pendingCount = queue.filter(t => t.status === 'pending').length;
-    const generatedCount = queue.filter(t => t.status === 'generated').length;
-    
-    if (pendingCount > 0 && generatedCount === 0 && !isGenerating) {
+    const interval = setInterval(() => {
+      const pendingItems = queue.filter(t => t.status === 'pending');
+      const generatedCount = queue.filter(t => t.status === 'generated').length;
+
+      if (pendingItems.length === 0 || generatedCount > 0 || isGenerating) {
+        setIsTimerActive(false);
+        setCountdown(timerDuration);
+        return;
+      }
+
+      const nowMs = Date.now();
+      const nextDueMs = pendingItems
+        .map((item) => {
+          const scheduledMs = toMillisSafe(item.scheduledAt);
+          if (scheduledMs !== null) return scheduledMs;
+          const createdMs = toMillisSafe(item.createdAt);
+          const itemDelaySeconds = typeof item.delaySeconds === "number" ? Math.max(0, item.delaySeconds) : Math.max(0, timerDuration);
+          if (createdMs !== null) return createdMs + (itemDelaySeconds * 1000);
+          return null;
+        })
+        .filter((value): value is number => value !== null)
+        .sort((a, b) => a - b)[0];
+
+      if (nextDueMs === undefined) {
+        setIsTimerActive(false);
+        setCountdown(timerDuration);
+        return;
+      }
+
       setIsTimerActive(true);
-    } else {
-      setIsTimerActive(false);
-      setCountdown(timerDuration);
-    }
+      setCountdown(Math.max(0, Math.ceil((nextDueMs - nowMs) / 1000)));
+    }, 1000);
+
+    return () => clearInterval(interval);
   }, [queue, isGenerating, timerDuration]);
 
   React.useEffect(() => {
-    let interval: any;
-    if (isTimerActive && countdown > 0) {
-      interval = setInterval(() => {
-        setCountdown(prev => prev - 1);
-      }, 1000);
-    } else if (isTimerActive && countdown === 0) {
+    if (isTimerActive && countdown === 0 && !isGenerating) {
       console.log("Timer hit zero, auto-triggering pre-generation...");
       preGenerate().catch((err) => {
         console.error("Auto pre-generate failed:", err);
       });
     }
-    return () => clearInterval(interval);
-  }, [isTimerActive, countdown]);
+  }, [isTimerActive, countdown, isGenerating]);
 
   const updateTimerDuration = async (newTotal: number) => {
     setTimerDuration(newTotal);
@@ -322,11 +356,14 @@ export default function BlogDashboard({ onLogout }: { onLogout?: () => void }) {
     try {
       toast.info(`Adding ${topicList.length} topics to queue...`);
       for (const item of topicList) {
+        const scheduledAt = new Date(Date.now() + Math.max(0, timerDuration) * 1000);
         await addDoc(collection(db, queueCollectionName), {
           topic: item.topic,
           customInstructions: item.instructions,
           status: "pending",
           createdAt: serverTimestamp(),
+          scheduledAt,
+          delaySeconds: Math.max(0, timerDuration),
           instanceId,
         });
       }
